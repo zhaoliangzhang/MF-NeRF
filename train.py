@@ -31,6 +31,7 @@ from torchmetrics import (
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 # pytorch-lightning
+import pytorch_lightning
 from pytorch_lightning.plugins import DDPPlugin
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
@@ -68,7 +69,9 @@ class NeRFSystem(LightningModule):
                 p.requires_grad = False
 
         rgb_act = 'None' if self.hparams.use_exposure else 'Sigmoid'
-        self.model = NGP(scale=self.hparams.scale, rgb_act=rgb_act)
+        self.model = NGP(scale=self.hparams.scale, 
+                            hparams=hparams,
+                            rgb_act=rgb_act)
         G = self.model.grid_size
         self.model.register_buffer('density_grid',
             torch.zeros(self.model.cascades, G**3))
@@ -133,8 +136,8 @@ class NeRFSystem(LightningModule):
         if self.hparams.optimize_ext:
             opts += [FusedAdam([self.dR, self.dT], 1e-6)] # learning rate is hard-coded
         net_sch = CosineAnnealingLR(self.net_opt,
-                                    self.hparams.num_epochs,
-                                    self.hparams.lr/30)
+                                    self.hparams.num_epochs-1,
+                                    self.hparams.lr*0.01)
 
         return opts, [net_sch]
 
@@ -245,9 +248,15 @@ class NeRFSystem(LightningModule):
 
 if __name__ == '__main__':
     hparams = get_opts()
+    pytorch_lightning.seed_everything(hparams.seed)
     if hparams.val_only and (not hparams.ckpt_path):
         raise ValueError('You need to provide a @ckpt_path for validation!')
-    system = NeRFSystem(hparams)
+
+    if hparams.val_only:
+        system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
+    else:
+        system = NeRFSystem(hparams)
+    # system = NeRFSystem(hparams)
 
     ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
@@ -273,7 +282,8 @@ if __name__ == '__main__':
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 
-    trainer.fit(system, ckpt_path=hparams.ckpt_path)
+    trainer.fit(system)
+    # trainer.fit(system, ckpt_path=hparams.ckpt_path)
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \

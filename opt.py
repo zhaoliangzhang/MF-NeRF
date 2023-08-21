@@ -67,4 +67,29 @@ def get_opts():
     parser.add_argument('--weight_path', type=str, default=None,
                         help='pretrained checkpoint to load (excluding optimizers, etc)')
 
+    # network config
+    parser.add_argument('--grid', type=str, default='Hash',
+                        choices=['Hash', 'Window', "MixedFeature"],
+                        help='Encoding scheme Hash or MixedFeature')
+    parser.add_argument('--L', type=int, default=16,
+                        help='Encoding hyper parameter L')
+    parser.add_argument('--F', type=int, default=2,
+                        help='Encoding hyper parameter F')
+    parser.add_argument('--T', type=int, default=19,
+                        help='Encoding hyper parameter T')
+    parser.add_argument('--N_min', type=int, default=16,
+                        help='Encoding hyper parameter N_min')
+    parser.add_argument('--N_max', type=int, default=2048,
+                        help='Encoding hyper parameter N_max')
+    parser.add_argument('--N_tables', type=int, default=1,
+                        help='Number of hash tables')
+
+    parser.add_argument('--rgb_channels', type=int, default=64,
+                        help='rgb network channels')
+    parser.add_argument('--rgb_layers', type=int, default=2,
+                        help='rgb network layers')
+
+    parser.add_argument('--seed', type=int, default=1337,
+                        help='random seed')
+
     return parser.parse_args()

@@ -10,7 +10,7 @@ from .rendering import NEAR_DISTANCE
 
 
 class NGP(nn.Module):
-    def __init__(self, scale, rgb_act='Sigmoid'):
+    def __init__(self, scale, hparams, rgb_act='Sigmoid'):
         super().__init__()
 
         self.rgb_act = rgb_act
@@ -29,20 +29,21 @@ class NGP(nn.Module):
             torch.zeros(self.cascades*self.grid_size**3//8, dtype=torch.uint8))
 
         # constants
-        L = 16; F = 2; log2_T = 19; N_min = 16
-        b = np.exp(np.log(2048*scale/N_min)/(L-1))
+        L = hparams.L; F = hparams.F; log2_T = hparams.T; N_min = hparams.N_min; N_tables = hparams.N_tables
+        b = np.exp(np.log(hparams.N_max*scale/N_min)/(L-1))
         print(f'GridEncoding: Nmin={N_min} b={b:.5f} F={F} T=2^{log2_T} L={L}')
 
         self.xyz_encoder = \
             tcnn.NetworkWithInputEncoding(
                 n_input_dims=3, n_output_dims=16,
                 encoding_config={
-                    "otype": "Grid",
-	                "type": "Hash",
+                    "otype": f"{hparams.grid}Grid",    # HashGrid / WindowGrid
+                    "type": hparams.grid,     # Hash / Window
                     "n_levels": L,
                     "n_features_per_level": F,
                     "log2_hashmap_size": log2_T,
                     "base_resolution": N_min,
+                    "n_tables": N_tables,
                     "per_level_scale": b,
                     "interpolation": "Linear"
                 },
@@ -54,6 +55,7 @@ class NGP(nn.Module):
                     "n_hidden_layers": 1,
                 }
             )
+        print(f'# features = {self.xyz_encoder.params.shape[0]-3072}')
 
         self.dir_encoder = \
             tcnn.Encoding(
@@ -71,8 +73,8 @@ class NGP(nn.Module):
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
                     "output_activation": self.rgb_act,
-                    "n_neurons": 64,
-                    "n_hidden_layers": 2,
+                    "n_neurons": hparams.rgb_channels,
+                    "n_hidden_layers": hparams.rgb_layers,
                 }
             )
 

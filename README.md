@@ -1,5 +1,7 @@
-# ngp_pl
+# Mixed-Feature NeRF
+[paper](https://arxiv.org/abs/2304.12587)
 
+# ngp_pl
 ### Advertisement: Check out the latest integrated project [nerfstudio](https://github.com/nerfstudio-project/nerfstudio)! There are a lot of recent improvements on nerf related methods, including instant-ngp!
 
 <!-- ### Update 2022 July 29th: GUI prototype is available now (see following video)!

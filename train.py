@@ -32,11 +32,12 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 # pytorch-lightning
 import pytorch_lightning
-from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.strategies import SingleDeviceStrategy
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.distributed import all_gather_ddp_if_available
+from lightning_fabric.utilities.distributed import _all_gather_ddp_if_available as new_all_gather_ddp_if_available
 
 from utils import slim_ckpt, load_ckpt
 
@@ -55,6 +56,8 @@ class NeRFSystem(LightningModule):
     def __init__(self, hparams):
         super().__init__()
         self.save_hyperparameters(hparams)
+
+        self.validation_step_outputs = []
 
         self.warmup_steps = 256
         self.update_interval = 16
@@ -223,20 +226,21 @@ class NeRFSystem(LightningModule):
             imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
             imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
 
+        self.validation_step_outputs.append(logs)
         return logs
 
-    def validation_epoch_end(self, outputs):
-        psnrs = torch.stack([x['psnr'] for x in outputs])
-        mean_psnr = all_gather_ddp_if_available(psnrs).mean()
+    def on_validation_epoch_end(self):
+        psnrs = torch.stack([x['psnr'] for x in self.validation_step_outputs.append])
+        mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
         self.log('test/psnr', mean_psnr, True)
 
-        ssims = torch.stack([x['ssim'] for x in outputs])
-        mean_ssim = all_gather_ddp_if_available(ssims).mean()
+        ssims = torch.stack([x['ssim'] for x in self.validation_step_outputs.append])
+        mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
         self.log('test/ssim', mean_ssim)
 
         if self.hparams.eval_lpips:
-            lpipss = torch.stack([x['lpips'] for x in outputs])
-            mean_lpips = all_gather_ddp_if_available(lpipss).mean()
+            lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs.append])
+            mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
             self.log('test/lpips_vgg', mean_lpips)
 
     def get_progress_bar_dict(self):
@@ -277,8 +281,8 @@ if __name__ == '__main__':
                       enable_model_summary=False,
                       accelerator='gpu',
                       devices=hparams.num_gpus,
-                      strategy=DDPPlugin(find_unused_parameters=False)
-                               if hparams.num_gpus>1 else None,
+                      strategy="ddp"
+                               if hparams.num_gpus>1 else "ddp",
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 

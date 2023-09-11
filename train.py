@@ -153,7 +153,7 @@ class NeRFSystem(LightningModule):
 
     def val_dataloader(self):
         return DataLoader(self.test_dataset,
-                          num_workers=8,
+                          num_workers=1,
                           batch_size=None,
                           pin_memory=True)
 
@@ -230,16 +230,16 @@ class NeRFSystem(LightningModule):
         return logs
 
     def on_validation_epoch_end(self):
-        psnrs = torch.stack([x['psnr'] for x in self.validation_step_outputs.append])
+        psnrs = torch.stack([x['psnr'] for x in self.validation_step_outputs])
         mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
         self.log('test/psnr', mean_psnr, True)
 
-        ssims = torch.stack([x['ssim'] for x in self.validation_step_outputs.append])
+        ssims = torch.stack([x['ssim'] for x in self.validation_step_outputs])
         mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
         self.log('test/ssim', mean_ssim)
 
         if self.hparams.eval_lpips:
-            lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs.append])
+            lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs])
             mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
             self.log('test/lpips_vgg', mean_lpips)
 
@@ -282,7 +282,7 @@ if __name__ == '__main__':
                       accelerator='gpu',
                       devices=hparams.num_gpus,
                       strategy="ddp"
-                               if hparams.num_gpus>1 else "ddp",
+                               if hparams.num_gpus>1 else "auto",
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 

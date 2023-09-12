@@ -107,6 +107,22 @@ class NGP(nn.Module):
         sigmas = TruncExp.apply(h[:, 0])
         if return_feat: return sigmas, h
         return sigmas
+    
+    # def density_fn(self, x, return_feat=False):
+    #     """
+    #     Inputs:
+    #         x: (N, 3) xyz in [-scale, scale]
+    #         return_feat: whether to return intermediate feature
+
+    #     Outputs:
+    #         sigmas: (N)
+    #     """
+    #     print("x:", x, "xyz:", self.xyz_min)
+    #     x = (x-self.xyz_min)/(self.xyz_max-self.xyz_min)
+    #     h = self.xyz_encoder(x)
+    #     sigmas = TruncExp.apply(h[:, 0])
+    #     if return_feat: return sigmas, h
+    #     return sigmas
 
     def log_radiance_to_rgb(self, log_radiances, **kwargs):
         """

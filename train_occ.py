@@ -39,6 +39,8 @@ from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from lightning_fabric.utilities.distributed import _all_gather_ddp_if_available as new_all_gather_ddp_if_available
 
+import nerfacc
+
 from utils import slim_ckpt, load_ckpt
 
 
@@ -81,6 +83,29 @@ class NeRFSystem(LightningModule):
             torch.zeros(self.model.cascades, G**3))
         self.model.register_buffer('grid_coords',
             create_meshgrid3d(G, G, G, False, dtype=torch.int32).reshape(-1, 3))
+        
+        aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device='cuda:0')
+        self.estimator = nerfacc.OccGridEstimator(roi_aabb=aabb, resolution=128, levels=4).to('cuda:0')
+
+    def sigma_fn(self,
+        t_starts, t_ends, ray_indices):
+        """ Define how to query density for the estimator."""
+        t_origins = self.rays_o[ray_indices]  # (n_samples, 3)
+        t_dirs = self.rays_d[ray_indices]  # (n_samples, 3)
+        positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        # print("positions:", positions)
+        sigmas = self.model.density(x=positions)
+        # print("sigmas:", sigmas)
+        return sigmas  # (n_samples,)
+
+    def rgb_sigma_fn(self,
+        t_starts, t_ends, ray_indices):
+        """ Query rgb and density values from a user-defined radiance field. """
+        t_origins = self.rays_o[ray_indices]  # (n_samples, 3)
+        t_dirs = self.rays_d[ray_indices]  # (n_samples, 3)
+        positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        sigmas, rgbs = self.model(x=positions, d=t_dirs)
+        return rgbs, sigmas  # (n_samples, 3), (n_samples,)
 
     def forward(self, batch, split):
         if split=='train':
@@ -95,7 +120,13 @@ class NeRFSystem(LightningModule):
             poses[..., :3] = dR @ poses[..., :3]
             poses[..., 3] += self.dT[batch['img_idxs']]
 
-        rays_o, rays_d = get_rays(directions, poses)
+        self.rays_o, self.rays_d = get_rays(directions, poses)
+        # print(self.rays_o, '\n', self.rays_d)
+        ray_indices, t_starts, t_ends = self.estimator.sampling(
+            self.rays_o, self.rays_d, sigma_fn=self.sigma_fn, near_plane=0, far_plane=1.0, early_stop_eps=1e-4, alpha_thre=1e-4, )
+        # print("tag1:", ray_indices, t_starts, t_ends)
+        color, opacity, depth, extras = nerfacc.rendering(
+            t_starts, t_ends, ray_indices, n_rays=self.rays_o.shape[0], rgb_sigma_fn=self.rgb_sigma_fn)
 
         kwargs = {'test_time': split!='train',
                   'random_bg': self.hparams.random_bg}
@@ -104,7 +135,12 @@ class NeRFSystem(LightningModule):
         if self.hparams.use_exposure:
             kwargs['exposure'] = batch['exposure']
 
-        return render(self.model, rays_o, rays_d, **kwargs)
+        # return render(self.model, rays_o, rays_d, **kwargs)
+        results = {'opacity':opacity, 
+        'depth':depth, 'rgb':color, 
+        'total_samples':ray_indices.size(dim=0),
+        'vr_samples':ray_indices.size(dim=0)}
+        return results
 
     def setup(self, stage):
         dataset = dataset_dict[self.hparams.dataset_name]
@@ -164,11 +200,20 @@ class NeRFSystem(LightningModule):
                                         self.train_dataset.img_wh)
 
     def training_step(self, batch, batch_nb, *args):
+        def occ_eval_fn(x):
+            density = self.model.density(x)
+            return density
         if self.global_step%self.update_interval == 0:
             self.model.update_density_grid(0.01*MAX_SAMPLES/3**0.5,
                                            warmup=self.global_step<self.warmup_steps,
                                            erode=self.hparams.dataset_name=='colmap')
 
+        self.estimator.train()
+        self.estimator.update_every_n_steps(
+            step=self.global_step,
+            occ_eval_fn=occ_eval_fn,
+            occ_thre=1e-2)
+        # print("estimator sum:", self.estimator.binaries.sum())
         results = self(batch, split='train')
         loss_d = self.loss(results, batch)
         if self.hparams.use_exposure:
@@ -184,7 +229,7 @@ class NeRFSystem(LightningModule):
         self.log('lr', self.net_opt.param_groups[0]['lr'])
         self.log('train/loss', loss)
         # ray marching samples per ray (occupied space on the ray)
-        self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)
+        # self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)
         # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
         self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
         self.log('train/psnr', self.train_psnr, True)

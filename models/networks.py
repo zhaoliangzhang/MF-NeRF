@@ -105,6 +105,10 @@ class NGP(nn.Module):
         x = (x-self.xyz_min)/(self.xyz_max-self.xyz_min)
         h = self.xyz_encoder(x)
         sigmas = TruncExp.apply(h[:, 0])
+        # torch.set_printoptions(threshold=100_000)
+        # print(x)
+        # print(h)
+        # print(sigmas)
         if return_feat: return sigmas, h
         return sigmas
     

@@ -185,7 +185,9 @@ class NeRFSystem(LightningModule):
         # ray marching samples per ray (occupied space on the ray)
         self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)
         # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
-        self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        self.log('train', results['vr_samples'], True)
+        self.log('vr_s', len(batch['rgb']), True)
         self.log('train/psnr', self.train_psnr, True)
 
         return loss

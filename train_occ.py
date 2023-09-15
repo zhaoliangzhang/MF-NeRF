@@ -84,18 +84,21 @@ class NeRFSystem(LightningModule):
         self.model.register_buffer('grid_coords',
             create_meshgrid3d(G, G, G, False, dtype=torch.int32).reshape(-1, 3))
         
-        aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5], device='cuda:0')
+        aabb = torch.tensor([0, 0, 0, 1, 1, 1], device='cuda:0')
+        self.render_step_size = ((aabb[3:] - aabb[:3]) ** 2).sum().sqrt().item() / 1000
         self.estimator = nerfacc.OccGridEstimator(roi_aabb=aabb, resolution=128, levels=4).to('cuda:0')
 
     def sigma_fn(self,
         t_starts, t_ends, ray_indices):
         """ Define how to query density for the estimator."""
+        # print(t_starts, t_ends)
         t_origins = self.rays_o[ray_indices]  # (n_samples, 3)
         t_dirs = self.rays_d[ray_indices]  # (n_samples, 3)
-        positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        # positions = t_origins + t_dirs * (t_starts + t_ends)[:, None] / 2.0
+        positions = t_origins + t_dirs
         # print("positions:", positions)
         sigmas = self.model.density(x=positions)
-        # print("sigmas:", sigmas)
+        # print("sigmas:", sigmas.size())
         return sigmas  # (n_samples,)
 
     def rgb_sigma_fn(self,
@@ -122,8 +125,16 @@ class NeRFSystem(LightningModule):
 
         self.rays_o, self.rays_d = get_rays(directions, poses)
         # print(self.rays_o, '\n', self.rays_d)
+        if self.global_step >= 500:
+            alpha_thre = 3e-1
+        elif self.global_step >= 300 and self.global_step <500:
+            alpha_thre = 2e-1
+        elif self.global_step >= 100 and self.global_step <300:
+            alpha_thre = 1e-1
+        else:
+            alpha_thre = 9.99e-4
         ray_indices, t_starts, t_ends = self.estimator.sampling(
-            self.rays_o, self.rays_d, sigma_fn=self.sigma_fn, near_plane=0, far_plane=1.0, early_stop_eps=1e-4, alpha_thre=1e-4, )
+            self.rays_o, self.rays_d, sigma_fn=self.sigma_fn, near_plane=0, far_plane=1.0, alpha_thre=alpha_thre)
         # print("tag1:", ray_indices, t_starts, t_ends)
         color, opacity, depth, extras = nerfacc.rendering(
             t_starts, t_ends, ray_indices, n_rays=self.rays_o.shape[0], rgb_sigma_fn=self.rgb_sigma_fn)
@@ -202,17 +213,18 @@ class NeRFSystem(LightningModule):
     def training_step(self, batch, batch_nb, *args):
         def occ_eval_fn(x):
             density = self.model.density(x)
-            return density
+            return density * self.render_step_size
         if self.global_step%self.update_interval == 0:
             self.model.update_density_grid(0.01*MAX_SAMPLES/3**0.5,
                                            warmup=self.global_step<self.warmup_steps,
                                            erode=self.hparams.dataset_name=='colmap')
 
-        self.estimator.train()
-        self.estimator.update_every_n_steps(
-            step=self.global_step,
-            occ_eval_fn=occ_eval_fn,
-            occ_thre=1e-2)
+        # self.estimator.train()
+            occ_thre = 1e-2 if self.global_step >= 100 else 9.99e-4
+            self.estimator.update_every_n_steps(
+                step=self.global_step,
+                occ_eval_fn=occ_eval_fn,
+                occ_thre=occ_thre)
         # print("estimator sum:", self.estimator.binaries.sum())
         results = self(batch, split='train')
         loss_d = self.loss(results, batch)
@@ -231,7 +243,9 @@ class NeRFSystem(LightningModule):
         # ray marching samples per ray (occupied space on the ray)
         # self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)
         # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
-        self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        self.log('train', results['vr_samples'], True)
+        self.log('vr_s', len(batch['rgb']), True)
         self.log('train/psnr', self.train_psnr, True)
 
         return loss

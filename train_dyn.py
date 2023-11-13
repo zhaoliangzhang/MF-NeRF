@@ -16,7 +16,7 @@ from datasets.ray_utils import axisangle_to_R, get_rays
 
 # models
 from kornia.utils.grid import create_meshgrid3d
-from models.networks import NGP
+from models.networks import DynNGP
 from models.rendering import render, MAX_SAMPLES
 
 # optimizer, losses
@@ -58,7 +58,7 @@ class NeRFSystem(LightningModule):
         super().__init__()
         self.save_hyperparameters(hparams)
 
-        self.validation_step_outputs = []
+        self.validation_step_outputs = [[],[]]
 
         self.warmup_steps = 256
         self.update_interval = 16
@@ -73,7 +73,7 @@ class NeRFSystem(LightningModule):
                 p.requires_grad = False
 
         rgb_act = 'None' if self.hparams.use_exposure else 'Sigmoid'
-        self.model = NGP(scale=self.hparams.scale, 
+        self.model = DynNGP(scale=self.hparams.scale, 
                             hparams=hparams,
                             rgb_act=rgb_act)
         G = self.model.grid_size
@@ -168,9 +168,19 @@ class NeRFSystem(LightningModule):
             self.model.update_density_grid(0.01*MAX_SAMPLES/3**0.5,
                                            warmup=self.global_step<self.warmup_steps,
                                            erode=self.hparams.dataset_name=='colmap')
-
-        results = self(batch, split='train')
-        loss_d = self.loss(results, batch)
+        # if(self.hparams.grid == "DynamicFeature"):
+        #     self.model.xyz_encoder.switch_subgrid(int(self.global_step/100)%4)
+        results = []
+        loss_d = {}
+        for i in range(2):
+            self.model.subgrid = i
+            results.append(self(batch, split='train'))
+            # print(self.loss(results[i], batch))
+            if (i==0):
+                loss_d = self.loss(results[i], batch)
+            else:
+                loss_d["rgb"] += self.loss(results[i], batch)["rgb"]
+                loss_d["opacity"] += self.loss(results[i], batch)["opacity"]
         if self.hparams.use_exposure:
             zero_radiance = torch.zeros(1, 3, device=self.device)
             unit_exposure_rgb = self.model.log_radiance_to_rgb(zero_radiance,
@@ -180,16 +190,28 @@ class NeRFSystem(LightningModule):
         loss = sum(lo.mean() for lo in loss_d.values())
 
         with torch.no_grad():
-            self.train_psnr(results['rgb'], batch['rgb'])
-        self.log('lr', self.net_opt.param_groups[0]['lr'])
-        self.log('train/loss', loss)
+            self.train_psnr(results[0]['rgb'], batch['rgb'])
+        # self.log('lr', self.net_opt.param_groups[0]['lr'])
+        self.log('train0/loss', loss)
         # ray marching samples per ray (occupied space on the ray)
-        self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)
+        self.log('train0/rm_s', results[0]['rm_samples']/len(batch['rgb']), True)
         # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
         # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
-        self.log('train', results['vr_samples'], True)
-        self.log('vr_s', len(batch['rgb']), True)
-        self.log('train/psnr', self.train_psnr, True)
+        self.log('train0', results[0]['vr_samples'], True)
+        self.log('vr_s0', len(batch['rgb']), True)
+        self.log('train0/psnr', self.train_psnr, True)
+        
+        with torch.no_grad():
+            self.train_psnr(results[1]['rgb'], batch['rgb'])
+        self.log('lr', self.net_opt.param_groups[0]['lr'])
+        self.log('train1/loss', loss)
+        # ray marching samples per ray (occupied space on the ray)
+        self.log('train1/rm_s', results[1]['rm_samples']/len(batch['rgb']), True)
+        # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
+        # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        self.log('train1', results[1]['vr_samples'], True)
+        self.log('vr_s1', len(batch['rgb']), True)
+        self.log('train1/psnr', self.train_psnr, True)
 
         return loss
 
@@ -200,49 +222,65 @@ class NeRFSystem(LightningModule):
             os.makedirs(self.val_dir, exist_ok=True)
 
     def validation_step(self, batch, batch_nb):
-        rgb_gt = batch['rgb']
-        logs = {}
-        t_render = time.time()
-        results = self(batch, split='test')
-        logs['render_duration'] = time.time() - t_render
+        # rgb_gt = batch['rgb']
+        # results = []
+        # for i in range(1):
+        #     self.model.subgrid = 1
+        #     results.append(self(batch, split='test'))
+
+        # logs = {}
+        # logs = []
         # compute each metric per image
-        self.val_psnr(results['rgb'], rgb_gt)
-        logs['psnr'] = self.val_psnr.compute()
-        self.val_psnr.reset()
-        w, h = self.train_dataset.img_wh
-        rgb_pred = rearrange(results['rgb'], '(h w) c -> 1 c h w', h=h)
-        rgb_gt = rearrange(rgb_gt, '(h w) c -> 1 c h w', h=h)
-        self.val_ssim(rgb_pred, rgb_gt)
-        logs['ssim'] = self.val_ssim.compute()
-        self.val_ssim.reset()
-        if self.hparams.eval_lpips:
-            self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
-                           torch.clip(rgb_gt*2-1, -1, 1))
-            logs['lpips'] = self.val_lpips.compute()
-            self.val_lpips.reset()
-        if not self.hparams.no_save_test: # save test image to disk
-            idx = batch['img_idxs']
-            rgb_pred = rearrange(results['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
-            rgb_pred = (rgb_pred*255).astype(np.uint8)
-            depth = depth2img(rearrange(results['depth'].cpu().numpy(), '(h w) -> h w', h=h))
-            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
-            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
-        self.validation_step_outputs.append(logs)
-        return logs
+        for i in range(2):
+            rgb_gt = batch['rgb']
+            self.model.subgrid = i
+            temp_log = {}
+            t_render = time.time()
+            result = self(batch, split='test')
+            temp_log['render_duration'] = time.time() - t_render
+            self.val_psnr(result['rgb'], rgb_gt)
+            temp_log['psnr'] = self.val_psnr.compute()
+            self.val_psnr.reset()
+
+            w, h = self.train_dataset.img_wh
+            rgb_pred = rearrange(result['rgb'], '(h w) c -> 1 c h w', h=h)
+            rgb_gt = rearrange(rgb_gt, '(h w) c -> 1 c h w', h=h)
+            self.val_ssim(rgb_pred, rgb_gt)
+            temp_log['ssim'] = self.val_ssim.compute()
+            self.val_ssim.reset()
+            if self.hparams.eval_lpips:
+                self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
+                            torch.clip(rgb_gt*2-1, -1, 1))
+                temp_log['lpips'] = self.val_lpips.compute()
+                self.val_lpips.reset()
+
+            if not self.hparams.no_save_test: # save test image to disk
+                idx = batch['img_idxs']
+                rgb_pred = rearrange(result['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
+                rgb_pred = (rgb_pred*255).astype(np.uint8)
+                depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
+                imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
+                imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
+            self.validation_step_outputs[i].append(temp_log)
+        # return logs
 
     def on_validation_epoch_end(self):
-        psnrs = torch.stack([x['psnr'] for x in self.validation_step_outputs])
-        mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
-        self.log('test/psnr', mean_psnr, True)
-        ssims = torch.stack([x['ssim'] for x in self.validation_step_outputs])
-        mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
-        self.log('test/ssim', mean_ssim)
-        mean_fps = 1 / np.mean([x['render_duration'] for x in self.validation_step_outputs])
-        self.log('test/fps', mean_fps, True)
-        if self.hparams.eval_lpips:
-            lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs])
-            mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
-            self.log('test/lpips_vgg', mean_lpips)
+        for i in range(2):
+            psnrs = torch.stack([x['psnr'] for x in self.validation_step_outputs[i]])
+            mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
+            self.log('test'+str(i)+'/psnr', mean_psnr, True)
+
+            ssims = torch.stack([x['ssim'] for x in self.validation_step_outputs[i]])
+            mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
+            self.log('test'+str(i)+'/ssim', mean_ssim)
+
+            mean_fps = 1 / np.mean([x['render_duration'] for x in self.validation_step_outputs[i]])
+            self.log('test'+str(i)+'/fps', mean_fps, True)
+
+            if self.hparams.eval_lpips:
+                lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs[i]])
+                mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
+                self.log('test'+str(i)+'/lpips_vgg', mean_lpips)
 
     def get_progress_bar_dict(self):
         # don't show the version number

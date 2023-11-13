@@ -69,7 +69,7 @@ def get_opts():
 
     # network config
     parser.add_argument('--grid', type=str, default='Hash',
-                        choices=['Hash', 'Window', "MixedFeature"],
+                        choices=['Hash', 'Window', "MixedFeature", "DynamicFeature"],
                         help='Encoding scheme Hash or MixedFeature')
     parser.add_argument('--L', type=int, default=16,
                         help='Encoding hyper parameter L')
@@ -86,7 +86,7 @@ def get_opts():
 
     parser.add_argument('--rgb_channels', type=int, default=64,
                         help='rgb network channels')
-    parser.add_argument('--rgb_layers', type=int, default=2,
+    parser.add_argument('--rgb_layers', type=int, default=4,
                         help='rgb network layers')
 
     parser.add_argument('--seed', type=int, default=1337,

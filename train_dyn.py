@@ -1,3 +1,5 @@
+from typing import Any, Optional
+from pytorch_lightning.utilities.types import STEP_OUTPUT
 import torch
 from torch import nn
 from opt import get_opts
@@ -59,6 +61,7 @@ class NeRFSystem(LightningModule):
         self.save_hyperparameters(hparams)
 
         self.validation_step_outputs = [[],[]]
+        self.test_step_outputs = []
 
         self.warmup_steps = 256
         self.update_interval = 16
@@ -152,6 +155,12 @@ class NeRFSystem(LightningModule):
                           batch_size=None,
                           pin_memory=True)
 
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset,
+                          num_workers=1,
+                          batch_size=None,
+                          pin_memory=True)
+
     def val_dataloader(self):
         return DataLoader(self.test_dataset,
                           num_workers=1,
@@ -222,15 +231,6 @@ class NeRFSystem(LightningModule):
             os.makedirs(self.val_dir, exist_ok=True)
 
     def validation_step(self, batch, batch_nb):
-        # rgb_gt = batch['rgb']
-        # results = []
-        # for i in range(1):
-        #     self.model.subgrid = 1
-        #     results.append(self(batch, split='test'))
-
-        # logs = {}
-        # logs = []
-        # compute each metric per image
         for i in range(2):
             rgb_gt = batch['rgb']
             self.model.subgrid = i
@@ -261,8 +261,7 @@ class NeRFSystem(LightningModule):
                 depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
                 imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
                 imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
-            self.validation_step_outputs[i].append(temp_log)
-        # return logs
+        self.validation_step_outputs.append(temp_log)
 
     def on_validation_epoch_end(self):
         for i in range(2):
@@ -281,6 +280,70 @@ class NeRFSystem(LightningModule):
                 lpipss = torch.stack([x['lpips'] for x in self.validation_step_outputs[i]])
                 mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
                 self.log('test'+str(i)+'/lpips_vgg', mean_lpips)
+
+    def test_step(self, batch, batch_idx):
+        rgb_gt = batch['rgb']
+        temp_log = {}
+        t_render = time.time()
+        result = self(batch, split='test')
+        temp_log['render_duration'] = time.time() - t_render
+        self.val_psnr(result['rgb'], rgb_gt)
+        temp_log['psnr'] = self.val_psnr.compute()
+        self.val_psnr.reset()
+
+        w, h = self.train_dataset.img_wh
+        rgb_pred = rearrange(result['rgb'], '(h w) c -> 1 c h w', h=h)
+        rgb_gt = rearrange(rgb_gt, '(h w) c -> 1 c h w', h=h)
+        self.val_ssim(rgb_pred, rgb_gt)
+        temp_log['ssim'] = self.val_ssim.compute()
+        self.val_ssim.reset()
+        if self.hparams.eval_lpips:
+            self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
+                        torch.clip(rgb_gt*2-1, -1, 1))
+            temp_log['lpips'] = self.val_lpips.compute()
+            self.val_lpips.reset()
+
+        if not self.hparams.no_save_test: # save test image to disk
+            idx = batch['img_idxs']
+            rgb_pred = rearrange(result['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
+            rgb_pred = (rgb_pred*255).astype(np.uint8)
+            depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
+            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
+            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
+        self.test_step_outputs.append(temp_log)
+    
+    def on_test_epoch_start(self):
+        torch.cuda.empty_cache()
+        if not self.hparams.no_save_test:
+            self.val_dir = f'results/{self.hparams.dataset_name}/{self.hparams.exp_name}'
+            os.makedirs(self.val_dir, exist_ok=True)
+
+        self.register_buffer('directions', self.train_dataset.directions.to(self.device))
+        self.register_buffer('poses', self.train_dataset.poses.to(self.device))
+
+        if self.hparams.optimize_ext:
+            N = len(self.train_dataset.poses)
+            self.register_parameter('dR',
+                nn.Parameter(torch.zeros(N, 3, device=self.device)))
+            self.register_parameter('dT',
+                nn.Parameter(torch.zeros(N, 3, device=self.device)))
+
+    def on_test_epoch_end(self):
+        psnrs = torch.stack([x['psnr'] for x in self.test_step_outputs])
+        mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
+        self.log('test/psnr', mean_psnr, True)
+
+        ssims = torch.stack([x['ssim'] for x in self.test_step_outputs])
+        mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
+        self.log('test/ssim', mean_ssim)
+
+        mean_fps = 1 / np.mean([x['render_duration'] for x in self.test_step_outputs])
+        self.log('test/fps', mean_fps, True)
+
+        if self.hparams.eval_lpips:
+            lpipss = torch.stack([x['lpips'] for x in self.test_step_outputs])
+            mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
+            self.log('test/lpips_vgg', mean_lpips)
 
     def get_progress_bar_dict(self):
         # don't show the version number
@@ -323,7 +386,11 @@ if __name__ == '__main__':
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 
-    trainer.fit(system)
+    if hparams.val_only:
+        system.model.subgrid = 0
+        trainer.test(system)
+    else:
+        trainer.fit(system)
     # trainer.fit(system, ckpt_path=hparams.ckpt_path)
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch

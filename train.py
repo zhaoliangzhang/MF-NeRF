@@ -38,11 +38,14 @@ from pytorch_lightning.strategies import SingleDeviceStrategy
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from lightning_fabric.utilities.distributed import _all_gather_ddp_if_available as new_all_gather_ddp_if_available
 
 from utils import slim_ckpt, load_ckpt
 
 import warnings; warnings.filterwarnings("ignore")
+
+import wandb
 
 
 def depth2img(depth):
@@ -332,6 +335,8 @@ if __name__ == '__main__':
     else:
         system = NeRFSystem(hparams)
 
+    wandb_logger = WandbLogger(project='InstantNGP', job_type='train')
+
     ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
                               save_weights_only=True,
@@ -347,7 +352,7 @@ if __name__ == '__main__':
     trainer = Trainer(max_epochs=hparams.num_epochs if hparams.num_epochs else 1,
                       check_val_every_n_epoch=hparams.num_epochs if hparams.num_epochs else 1,
                       callbacks=callbacks,
-                      logger=logger,
+                      logger=wandb_logger,
                       enable_model_summary=False,
                       accelerator='gpu',
                       devices=hparams.num_gpus,
@@ -355,18 +360,29 @@ if __name__ == '__main__':
                                if hparams.num_gpus>1 else "auto",
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
-
+    
+    t_start = time.time()
     if hparams.val_only:
         trainer.test(system)
     else:
         trainer.fit(system)
+    t_total = time.time() - t_start
+    print("TOTAL:", t_total)
     # trainer.fit(system, ckpt_path=hparams.ckpt_path)
+
+    # run = wandb.init(project='InstantNGP')
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \
             slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
                       save_poses=hparams.optimize_ext)
         torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
+        # model_artifact = wandb.Artifact(
+        #     "InstantNGP", type="model",
+        #     description="InstantNGP Model")
+        # model_artifact.add_file('ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
+        # run.log_artifact(model_artifact)
+
 
     if (not hparams.no_save_test) and \
        hparams.dataset_name=='nsvf' and \

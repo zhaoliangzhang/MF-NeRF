@@ -5,6 +5,7 @@ import vren
 from einops import rearrange
 from .custom_functions import TruncExp
 import numpy as np
+import time
 
 from .rendering import NEAR_DISTANCE
 
@@ -69,13 +70,13 @@ class NGP(nn.Module):
 
         self.rgb_net = \
             tcnn.Network(
-                n_input_dims=32, n_output_dims=3,
+                n_input_dims=32, n_output_dims=64,
                 network_config={
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
                     "output_activation": self.rgb_act,
                     "n_neurons": hparams.rgb_channels,
-                    "n_hidden_layers": hparams.rgb_layers,
+                    "n_hidden_layers": 3,
                 }
             )
 

@@ -40,11 +40,16 @@ from pytorch_lightning.strategies import SingleDeviceStrategy
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import TQDMProgressBar, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 from lightning_fabric.utilities.distributed import _all_gather_ddp_if_available as new_all_gather_ddp_if_available
 
 from utils import slim_ckpt, load_ckpt
 
 import warnings; warnings.filterwarnings("ignore")
+
+import wandb
+
+wandb.login()
 
 
 def depth2img(depth):
@@ -177,19 +182,13 @@ class NeRFSystem(LightningModule):
             self.model.update_density_grid(0.01*MAX_SAMPLES/3**0.5,
                                            warmup=self.global_step<self.warmup_steps,
                                            erode=self.hparams.dataset_name=='colmap')
-        # if(self.hparams.grid == "DynamicFeature"):
-        #     self.model.xyz_encoder.switch_subgrid(int(self.global_step/100)%4)
-        results = []
+
         loss_d = {}
-        for i in range(2):
-            self.model.subgrid = i
-            results.append(self(batch, split='train'))
-            # print(self.loss(results[i], batch))
-            if (i==0):
-                loss_d = self.loss(results[i], batch)
-            else:
-                loss_d["rgb"] += self.loss(results[i], batch)["rgb"]
-                loss_d["opacity"] += self.loss(results[i], batch)["opacity"]
+        self.model.subgrid = int(self.global_step)%2
+        results = self(batch, split='train')
+        loss_d = self.loss(results, batch)
+        loss_d["rgb"] += self.loss(results, batch)["rgb"]
+        loss_d["opacity"] += self.loss(results, batch)["opacity"]
         if self.hparams.use_exposure:
             zero_radiance = torch.zeros(1, 3, device=self.device)
             unit_exposure_rgb = self.model.log_radiance_to_rgb(zero_radiance,
@@ -199,28 +198,28 @@ class NeRFSystem(LightningModule):
         loss = sum(lo.mean() for lo in loss_d.values())
 
         with torch.no_grad():
-            self.train_psnr(results[0]['rgb'], batch['rgb'])
+            self.train_psnr(results['rgb'], batch['rgb'])
         # self.log('lr', self.net_opt.param_groups[0]['lr'])
         self.log('train0/loss', loss)
         # ray marching samples per ray (occupied space on the ray)
-        self.log('train0/rm_s', results[0]['rm_samples']/len(batch['rgb']), True)
+        self.log('train0/rm_s', results['rm_samples']/len(batch['rgb']), True)
         # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
         # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
-        self.log('train0', results[0]['vr_samples'], True)
+        self.log('train0', results['vr_samples'], True)
         self.log('vr_s0', len(batch['rgb']), True)
         self.log('train0/psnr', self.train_psnr, True)
         
-        with torch.no_grad():
-            self.train_psnr(results[1]['rgb'], batch['rgb'])
-        self.log('lr', self.net_opt.param_groups[0]['lr'])
-        self.log('train1/loss', loss)
-        # ray marching samples per ray (occupied space on the ray)
-        self.log('train1/rm_s', results[1]['rm_samples']/len(batch['rgb']), True)
-        # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
-        # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
-        self.log('train1', results[1]['vr_samples'], True)
-        self.log('vr_s1', len(batch['rgb']), True)
-        self.log('train1/psnr', self.train_psnr, True)
+        # with torch.no_grad():
+        #     self.train_psnr(results[1]['rgb'], batch['rgb'])
+        # self.log('lr', self.net_opt.param_groups[0]['lr'])
+        # self.log('train1/loss', loss)
+        # # ray marching samples per ray (occupied space on the ray)
+        # self.log('train1/rm_s', results[1]['rm_samples']/len(batch['rgb']), True)
+        # # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
+        # # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+        # self.log('train1', results[1]['vr_samples'], True)
+        # self.log('vr_s1', len(batch['rgb']), True)
+        # self.log('train1/psnr', self.train_psnr, True)
 
         return loss
 
@@ -261,7 +260,7 @@ class NeRFSystem(LightningModule):
                 depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
                 imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
                 imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
-        self.validation_step_outputs.append(temp_log)
+            self.validation_step_outputs[i].append(temp_log)
 
     def on_validation_epoch_end(self):
         for i in range(2):
@@ -361,6 +360,8 @@ if __name__ == '__main__':
         system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
     else:
         system = NeRFSystem(hparams)
+    
+    wandb_logger = WandbLogger(project='DynGrid', job_type='train')
 
     ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
@@ -377,7 +378,7 @@ if __name__ == '__main__':
     trainer = Trainer(max_epochs=hparams.num_epochs if hparams.num_epochs else 1,
                       check_val_every_n_epoch=hparams.num_epochs if hparams.num_epochs else 1,
                       callbacks=callbacks,
-                      logger=logger,
+                      logger=wandb_logger,
                       enable_model_summary=False,
                       accelerator='gpu',
                       devices=hparams.num_gpus,
@@ -386,12 +387,15 @@ if __name__ == '__main__':
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 
+    t_start = time.time()
     if hparams.val_only:
         system.model.subgrid = 0
         trainer.test(system)
     else:
         trainer.fit(system)
     # trainer.fit(system, ckpt_path=hparams.ckpt_path)
+    t_total = time.time() - t_start
+    print("TOTAL:", t_total)
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \

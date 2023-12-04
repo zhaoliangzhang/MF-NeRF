@@ -49,9 +49,6 @@ import warnings; warnings.filterwarnings("ignore")
 
 import wandb
 
-wandb.login()
-
-
 def depth2img(depth):
     depth = (depth-depth.min())/(depth.max()-depth.min())
     depth_img = cv2.applyColorMap((depth*255).astype(np.uint8),
@@ -66,7 +63,7 @@ class NeRFSystem(LightningModule):
         self.save_hyperparameters(hparams)
 
         self.validation_step_outputs = [[],[]]
-        self.test_step_outputs = []
+        self.test_step_outputs = [[],[]]
 
         self.warmup_steps = 256
         self.update_interval = 16
@@ -200,26 +197,25 @@ class NeRFSystem(LightningModule):
         with torch.no_grad():
             self.train_psnr(results['rgb'], batch['rgb'])
         # self.log('lr', self.net_opt.param_groups[0]['lr'])
-        self.log('train0/loss', loss)
-        # ray marching samples per ray (occupied space on the ray)
-        self.log('train0/rm_s', results['rm_samples']/len(batch['rgb']), True)
-        # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
-        # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
-        self.log('train0', results['vr_samples'], True)
-        self.log('vr_s0', len(batch['rgb']), True)
-        self.log('train0/psnr', self.train_psnr, True)
-        
-        # with torch.no_grad():
-        #     self.train_psnr(results[1]['rgb'], batch['rgb'])
-        # self.log('lr', self.net_opt.param_groups[0]['lr'])
-        # self.log('train1/loss', loss)
-        # # ray marching samples per ray (occupied space on the ray)
-        # self.log('train1/rm_s', results[1]['rm_samples']/len(batch['rgb']), True)
-        # # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
-        # # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
-        # self.log('train1', results[1]['vr_samples'], True)
-        # self.log('vr_s1', len(batch['rgb']), True)
-        # self.log('train1/psnr', self.train_psnr, True)
+        if(self.model.subgrid==0):
+            self.log('train0/loss', loss)
+            # ray marching samples per ray (occupied space on the ray)
+            self.log('train0/rm_s', results['rm_samples']/len(batch['rgb']), True)
+            # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
+            # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+            self.log('train0', results['vr_samples'], True)
+            self.log('vr_s0', len(batch['rgb']), True)
+            self.log('train0/psnr', self.train_psnr, True)
+        else:
+            # self.log('lr', self.net_opt.param_groups[0]['lr'])
+            self.log('train1/loss', loss)
+            # ray marching samples per ray (occupied space on the ray)
+            self.log('train1/rm_s', results['rm_samples']/len(batch['rgb']), True)
+            # volume rendering samples per ray (stops marching when transmittance drops below 1e-4)
+            # self.log('train/vr_s', results['vr_samples']/len(batch['rgb']), True)
+            self.log('train1', results['vr_samples'], True)
+            self.log('vr_s1', len(batch['rgb']), True)
+            self.log('train1/psnr', self.train_psnr, True)
 
         return loss
 
@@ -282,34 +278,36 @@ class NeRFSystem(LightningModule):
 
     def test_step(self, batch, batch_idx):
         rgb_gt = batch['rgb']
-        temp_log = {}
-        t_render = time.time()
-        result = self(batch, split='test')
-        temp_log['render_duration'] = time.time() - t_render
-        self.val_psnr(result['rgb'], rgb_gt)
-        temp_log['psnr'] = self.val_psnr.compute()
-        self.val_psnr.reset()
+        for i in range(2):
+            self.model.subgrid = i
+            temp_log = {}
+            t_render = time.time()
+            result = self(batch, split='test')
+            temp_log['render_duration'] = time.time() - t_render
+            self.val_psnr(result['rgb'], rgb_gt)
+            temp_log['psnr'] = self.val_psnr.compute()
+            self.val_psnr.reset()
 
-        w, h = self.train_dataset.img_wh
-        rgb_pred = rearrange(result['rgb'], '(h w) c -> 1 c h w', h=h)
-        rgb_gt = rearrange(rgb_gt, '(h w) c -> 1 c h w', h=h)
-        self.val_ssim(rgb_pred, rgb_gt)
-        temp_log['ssim'] = self.val_ssim.compute()
-        self.val_ssim.reset()
-        if self.hparams.eval_lpips:
-            self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
-                        torch.clip(rgb_gt*2-1, -1, 1))
-            temp_log['lpips'] = self.val_lpips.compute()
-            self.val_lpips.reset()
+            w, h = self.train_dataset.img_wh
+            rgb_pred = rearrange(result['rgb'], '(h w) c -> 1 c h w', h=h)
+            rgb_gt_ss = rearrange(rgb_gt, '(h w) c -> 1 c h w', h=h)
+            self.val_ssim(rgb_pred, rgb_gt_ss)
+            temp_log['ssim'] = self.val_ssim.compute()
+            self.val_ssim.reset()
+            if self.hparams.eval_lpips:
+                self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
+                            torch.clip(rgb_gt_ss*2-1, -1, 1))
+                temp_log['lpips'] = self.val_lpips.compute()
+                self.val_lpips.reset()
 
-        if not self.hparams.no_save_test: # save test image to disk
-            idx = batch['img_idxs']
-            rgb_pred = rearrange(result['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
-            rgb_pred = (rgb_pred*255).astype(np.uint8)
-            depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
-            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
-            imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
-        self.test_step_outputs.append(temp_log)
+            if not self.hparams.no_save_test: # save test image to disk
+                idx = batch['img_idxs']
+                rgb_pred = rearrange(result['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
+                rgb_pred = (rgb_pred*255).astype(np.uint8)
+                depth = depth2img(rearrange(result['depth'].cpu().numpy(), '(h w) -> h w', h=h))
+                imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}.png'), rgb_pred)
+                imageio.imsave(os.path.join(self.val_dir, f'{idx:03d}_d.png'), depth)
+            self.test_step_outputs[i].append(temp_log)
     
     def on_test_epoch_start(self):
         torch.cuda.empty_cache()
@@ -328,21 +326,22 @@ class NeRFSystem(LightningModule):
                 nn.Parameter(torch.zeros(N, 3, device=self.device)))
 
     def on_test_epoch_end(self):
-        psnrs = torch.stack([x['psnr'] for x in self.test_step_outputs])
-        mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
-        self.log('test/psnr', mean_psnr, True)
+        for i in range(2):
+            psnrs = torch.stack([x['psnr'] for x in self.test_step_outputs[i]])
+            mean_psnr = new_all_gather_ddp_if_available(psnrs).mean()
+            self.log('test'+str(i)+'/psnr', mean_psnr, True)
 
-        ssims = torch.stack([x['ssim'] for x in self.test_step_outputs])
-        mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
-        self.log('test/ssim', mean_ssim)
+            ssims = torch.stack([x['ssim'] for x in self.test_step_outputs[i]])
+            mean_ssim = new_all_gather_ddp_if_available(ssims).mean()
+            self.log('test'+str(i)+'/ssim', mean_ssim)
 
-        mean_fps = 1 / np.mean([x['render_duration'] for x in self.test_step_outputs])
-        self.log('test/fps', mean_fps, True)
+            mean_fps = 1 / np.mean([x['render_duration'] for x in self.test_step_outputs[i]])
+            self.log('test'+str(i)+'/fps', mean_fps, True)
 
-        if self.hparams.eval_lpips:
-            lpipss = torch.stack([x['lpips'] for x in self.test_step_outputs])
-            mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
-            self.log('test/lpips_vgg', mean_lpips)
+            if self.hparams.eval_lpips:
+                lpipss = torch.stack([x['lpips'] for x in self.test_step_outputs[i]])
+                mean_lpips = new_all_gather_ddp_if_available(lpipss).mean()
+                self.log('test'+str(i)+'/lpips_vgg', mean_lpips)
 
     def get_progress_bar_dict(self):
         # don't show the version number
@@ -358,10 +357,11 @@ if __name__ == '__main__':
 
     if hparams.val_only:
         system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
+        wandb_logger = WandbLogger(project=hparams.exp_name, job_type='test')
     else:
         system = NeRFSystem(hparams)
+        wandb_logger = WandbLogger(project=hparams.exp_name, job_type='train')
     
-    wandb_logger = WandbLogger(project='DynGrid', job_type='train')
 
     ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
@@ -387,15 +387,12 @@ if __name__ == '__main__':
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
 
-    t_start = time.time()
     if hparams.val_only:
-        system.model.subgrid = 0
+        system.model.subgrid = 1
         trainer.test(system)
     else:
         trainer.fit(system)
     # trainer.fit(system, ckpt_path=hparams.ckpt_path)
-    t_total = time.time() - t_start
-    print("TOTAL:", t_total)
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \

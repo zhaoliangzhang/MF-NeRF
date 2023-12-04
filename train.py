@@ -332,10 +332,10 @@ if __name__ == '__main__':
 
     if hparams.val_only:
         system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
+        wandb_logger = WandbLogger(project=hparams.exp_name, job_type='test')
     else:
         system = NeRFSystem(hparams)
-
-    wandb_logger = WandbLogger(project='InstantNGP', job_type='train')
+        wandb_logger = WandbLogger(project=hparams.exp_name, job_type='train')
 
     ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
@@ -345,9 +345,9 @@ if __name__ == '__main__':
                               save_top_k=-1)
     callbacks = [ckpt_cb, TQDMProgressBar(refresh_rate=1)]
 
-    logger = TensorBoardLogger(save_dir=f"logs/{hparams.dataset_name}",
-                               name=hparams.exp_name,
-                               default_hp_metric=False)
+    # logger = TensorBoardLogger(save_dir=f"logs/{hparams.dataset_name}",
+    #                            name=hparams.exp_name,
+    #                            default_hp_metric=False)
 
     trainer = Trainer(max_epochs=hparams.num_epochs if hparams.num_epochs else 1,
                       check_val_every_n_epoch=hparams.num_epochs if hparams.num_epochs else 1,
@@ -361,13 +361,10 @@ if __name__ == '__main__':
                       num_sanity_val_steps=-1 if hparams.val_only else 0,
                       precision=16)
     
-    t_start = time.time()
     if hparams.val_only:
         trainer.test(system)
     else:
         trainer.fit(system)
-    t_total = time.time() - t_start
-    print("TOTAL:", t_total)
     # trainer.fit(system, ckpt_path=hparams.ckpt_path)
 
     # run = wandb.init(project='InstantNGP')

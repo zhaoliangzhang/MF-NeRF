@@ -6,6 +6,7 @@ from einops import rearrange
 from .custom_functions import TruncExp
 import numpy as np
 import time
+import math
 
 from .rendering import NEAR_DISTANCE
 
@@ -70,7 +71,7 @@ class NGP(nn.Module):
 
         self.rgb_net = \
             tcnn.Network(
-                n_input_dims=32, n_output_dims=64,
+                n_input_dims=32, n_output_dims=3,
                 network_config={
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
@@ -297,14 +298,18 @@ class DynNGP(nn.Module):
 
         # constants
         L = hparams.L; F = hparams.F; log2_T = hparams.T; N_min = hparams.N_min; N_tables = hparams.N_tables
-        N_Max = 2048
-        N_Mid = 1024
-        N_Min = 16
-        b1 = np.exp(np.log(N_Mid*scale/N_Min)/(8-1))
-        b2 = np.exp(np.log(N_Max*scale/N_Mid)/(8-1))
-        print(f'GridEncoding: Nmin={N_Min} b={b1:.5f} F={F} T=2^{log2_T} L={L}')
+        N_max = 2048
+        N_min = 16
+        b = np.exp(np.log(N_max*scale/N_min)/(16-1))
+        N_mid = math.floor(N_min*math.pow(b,14))
+        # N_mid = 1024
+        # b1 = np.exp(np.log(N_mid*scale/N_min)/(8-1))
+        # b2 = np.exp(np.log(N_max*scale/N_mid)/(8-1))
+        print(f'GridEncoding: Nmin={N_min} b={b:.5f} F={F} T=2^{log2_T} L={L}')
+        print(f'GridEncoding: Nmin={N_mid} b={b:.5f} F={F} T=2^{log2_T} L={L}')
 
         self.subgrid = 0
+        self.padding = torch.nn.ConstantPad1d((0,16),0)
 
         self.xyz_encoder_1 = \
             tcnn.NetworkWithInputEncoding(
@@ -312,13 +317,13 @@ class DynNGP(nn.Module):
                 encoding_config={
                     "otype": f"{hparams.grid}Grid",    # HashGrid / WindowGrid / MixedFeaturesGrid
                     "type": hparams.grid,     # Hash / Window / MixedFeatures
-                    "n_levels": 8,
+                    "n_levels": 14,
                     "n_features_per_level": F,
                     "log2_hashmap_size": log2_T,
-                    "base_resolution": N_Min,
+                    "base_resolution": N_min,
                     "n_tables": N_tables,
                     "subgrid": 0,
-                    "per_level_scale": b1,
+                    "per_level_scale": b,
                     "interpolation": "Linear"
                 },
                 network_config={
@@ -335,13 +340,13 @@ class DynNGP(nn.Module):
                 encoding_config={
                     "otype": f"{hparams.grid}Grid",    # HashGrid / WindowGrid / MixedFeaturesGrid
                     "type": hparams.grid,     # Hash / Window / MixedFeatures
-                    "n_levels": 8,
+                    "n_levels": 2,
                     "n_features_per_level": F,
                     "log2_hashmap_size": log2_T,
-                    "base_resolution": N_Mid,
+                    "base_resolution": N_mid,
                     "n_tables": N_tables,
                     "subgrid": 0,
-                    "per_level_scale": b2,
+                    "per_level_scale": b,
                     "interpolation": "Linear"
                 },
                 network_config={
@@ -352,7 +357,9 @@ class DynNGP(nn.Module):
                     "n_hidden_layers": 1,
                 }
             )
-        print(f'# features = {self.xyz_encoder_1.params.shape[0]-3072}')
+        print(f'# feature1 = {self.xyz_encoder_1.params.shape[0]-3072}')
+        print(f'# feature2 = {self.xyz_encoder_2.params.shape[0]-3072}')
+        print(f'# features = {self.xyz_encoder_1.params.shape[0]+self.xyz_encoder_2.params.shape[0]-6144}')
 
         self.dir_encoder = \
             tcnn.Encoding(
@@ -363,44 +370,9 @@ class DynNGP(nn.Module):
                 },
             )
 
-        self.emb_encoder_1 = \
-            tcnn.Network(
-                n_input_dims=32, n_output_dims=64,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": self.rgb_act,
-                    "n_neurons": hparams.rgb_channels,
-                    "n_hidden_layers": 1,
-                }
-            )
-        self.emb_encoder_2 = \
-            tcnn.Network(
-                n_input_dims=48, n_output_dims=64,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": self.rgb_act,
-                    "n_neurons": hparams.rgb_channels,
-                    "n_hidden_layers": 1,
-                }
-            )
-        
-        self.rgb_net_1 = \
-            tcnn.Network(
-                n_input_dims=64, n_output_dims=3,
-                network_config={
-                    "otype": "FullyFusedMLP",
-                    "activation": "ReLU",
-                    "output_activation": self.rgb_act,
-                    "n_neurons": hparams.rgb_channels,
-                    "n_hidden_layers": 1,
-                }
-            )
-
-        # self.rgb_net_2= \
+        # self.emb_encoder_1 = \
         #     tcnn.Network(
-        #         n_input_dims=64, n_output_dims=3,
+        #         n_input_dims=32, n_output_dims=64,
         #         network_config={
         #             "otype": "FullyFusedMLP",
         #             "activation": "ReLU",
@@ -409,15 +381,39 @@ class DynNGP(nn.Module):
         #             "n_hidden_layers": 1,
         #         }
         #     )
-        # self.rgb_net_3= \
+        # self.emb_encoder_2 = \
         #     tcnn.Network(
-        #         n_input_dims=64, n_output_dims=3,
+        #         n_input_dims=48, n_output_dims=64,
         #         network_config={
         #             "otype": "FullyFusedMLP",
         #             "activation": "ReLU",
         #             "output_activation": self.rgb_act,
         #             "n_neurons": hparams.rgb_channels,
         #             "n_hidden_layers": 1,
+        #         }
+        #     )
+        
+        self.rgb_net = \
+            tcnn.Network(
+                n_input_dims=48, n_output_dims=3,
+                network_config={
+                    "otype": "FullyFusedMLP",
+                    "activation": "ReLU",
+                    "output_activation": self.rgb_act,
+                    "n_neurons": hparams.rgb_channels,
+                    "n_hidden_layers": 3,
+                }
+            )
+        
+        # self.rgb_net2 = \
+        #     tcnn.Network(
+        #         n_input_dims=48, n_output_dims=3,
+        #         network_config={
+        #             "otype": "FullyFusedMLP",
+        #             "activation": "ReLU",
+        #             "output_activation": self.rgb_act,
+        #             "n_neurons": hparams.rgb_channels,
+        #             "n_hidden_layers": 3,
         #         }
         #     )
 
@@ -451,10 +447,6 @@ class DynNGP(nn.Module):
         else:
             h = torch.cat([self.xyz_encoder_1(x), self.xyz_encoder_2(x)], 1)
         sigmas = TruncExp.apply(h[:, 0])
-        # torch.set_printoptions(threshold=100_000)
-        # print(x.shape)
-        # print(h.shape)
-        # print(sigmas)
         if return_feat: return sigmas, h
         return sigmas
 
@@ -495,11 +487,10 @@ class DynNGP(nn.Module):
         d = d/torch.norm(d, dim=1, keepdim=True)
         d = self.dir_encoder((d+1)/2)
         if(self.subgrid==0):
-            rgbs = self.rgb_net_1(self.emb_encoder_1(torch.cat([d, h], 1)))
-            # rgbs = self.rgb_net_2(rgbs)
+            rgbs = self.rgb_net(self.padding(torch.cat([d, h], 1)))
+            # rgbs = self.rgb_net(torch.cat([d, h], 1))
         else:
-            rgbs = self.rgb_net_1(self.emb_encoder_2(torch.cat([d, h], 1)))
-            # rgbs = self.rgb_net_3(rgbs)
+            rgbs = self.rgb_net(torch.cat([d, h], 1))
 
         if self.rgb_act == 'None': # rgbs is log-radiance
             if kwargs.get('output_radiance', False): # output HDR map
